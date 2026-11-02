@@ -1,0 +1,3 @@
+[submodule "CivSwitch"]
+	path = CivSwitch
+	url = https://github.com/Gezine/CivSwitch.git

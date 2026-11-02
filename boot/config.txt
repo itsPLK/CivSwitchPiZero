@@ -1,0 +1,11 @@
+# CivSwitch minimal fast-boot config for Raspberry Pi Zero / Zero W / Zero 2 W
+arm_64bit=0
+boot_delay=0
+boot_delay_ms=0
+disable_splash=1
+disable_poe_fan=1
+force_eeprom_read=0
+ignore_lcd=1
+dtparam=audio=off
+dtoverlay=dwc2,dr_mode=peripheral
+initramfs initramf.gz followkernel

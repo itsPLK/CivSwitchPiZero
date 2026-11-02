@@ -1,0 +1,89 @@
+name: Build CivSwitchPiZero Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string (e.g. v1.0.0). Leave empty for dev-<commit>'
+        required: false
+        default: ''
+        type: string
+      create_release:
+        description: 'Create a GitHub Release (requires version input)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler gcc-arm-linux-gnueabi libc6-dev-armel-cross
+
+      - name: Run transport regression tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Determine version & artifact name
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          SUBMODULE_SHA=$(git -C CivSwitch rev-parse --short HEAD)
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="dev-${SHORT_SHA}"
+          fi
+          IMG_NAME="CivSwitchPiZero-${VERSION}.img.gz"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "submodule_sha=${SUBMODULE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "img_name=${IMG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build SD card image
+        run: |
+          python3 tools/build_image.py
+          gzip -c -9 build/civ7-pizero.img > "build/${{ steps.meta.outputs.img_name }}"
+          (cd build && sha256sum "${{ steps.meta.outputs.img_name }}" > "${{ steps.meta.outputs.img_name }}.sha256")
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CivSwitchPiZero-${{ steps.meta.outputs.version }}
+          path: |
+            build/${{ steps.meta.outputs.img_name }}
+            build/${{ steps.meta.outputs.img_name }}.sha256
+          retention-days: 90
+
+      - name: Create GitHub Release
+        if: inputs.create_release && inputs.version != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.version }}
+          name: CivSwitchPiZero ${{ steps.meta.outputs.version }}
+          body: |
+            Minimal instant-boot Raspberry Pi Zero / Zero W / Zero 2 W image for CivSwitch.
+            - **Upstream CivSwitch submodule commit**: `${{ steps.meta.outputs.submodule_sha }}`
+            - Flash `${{ steps.meta.outputs.img_name }}` directly using Raspberry Pi Imager, balenaEtcher, or `gunzip -c ... | dd`.
+          files: |
+            build/${{ steps.meta.outputs.img_name }}
+            build/${{ steps.meta.outputs.img_name }}.sha256
