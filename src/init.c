@@ -33,6 +33,7 @@
 #ifdef __linux__
 #include <poll.h>
 #include <sys/mount.h>
+#include <sys/klog.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
@@ -728,6 +729,20 @@ static int open_dev_node(const char *dev_path, const char *sys_dev_path, bool is
     return -1;
 }
 
+static bool cfg_sd_log = false;
+static bool cfg_wifi_diagnostics = false;
+#ifdef LDN_CRYPTO
+static bool cfg_ldn_install = true;
+#else
+static bool cfg_ldn_install = false;
+#endif
+static bool ldn_target_selected = false;
+static bool ldn_supported_model(const char *model) {
+    return strncmp(model, "Raspberry Pi Zero W Rev ", strlen("Raspberry Pi Zero W Rev ")) == 0 ||
+           strncmp(model, "Raspberry Pi Zero 2 W Rev ", strlen("Raspberry Pi Zero 2 W Rev ")) == 0;
+}
+static char wifi_module_status[512];
+
 static void load_optional_config(const char *conf_path) {
     FILE *f = fopen(conf_path, "r");
     if (!f) return;
@@ -743,7 +758,10 @@ static void load_optional_config(const char *conf_path) {
         while (kend > k && isspace((unsigned char)kend[-1])) *--kend = '\0';
         if (k[0] == '#' || k[0] == '\0') continue;
         uint32_t val = (uint32_t)strtoul(v, NULL, 10);
-        if (strcmp(k, "LANG_JP") == 0) cfg_lang_jp = val != 0;
+        if (strcmp(k, "SD_LOG") == 0) cfg_sd_log = val == 1;
+        else if (strcmp(k, "LDN_INSTALL") == 0) cfg_ldn_install = val == 1;
+        else if (strcmp(k, "WIFI_DIAGNOSTICS") == 0) cfg_wifi_diagnostics = val == 1;
+        else if (strcmp(k, "LANG_JP") == 0) cfg_lang_jp = val != 0;
         else if (strcmp(k, "MACRO_START_DELAY_MS") == 0) cfg_macro_start_delay_ms = val;
         else if (strcmp(k, "KEY_HOLD_MS") == 0)      cfg_key_hold_ms          = val;
         else if (strcmp(k, "KEY_GAP_MS") == 0)       cfg_key_gap_ms           = val;
@@ -757,6 +775,76 @@ static void load_optional_config(const char *conf_path) {
         else if (strcmp(k, "ESC_TO_A_WAIT_MS") == 0) cfg_esc_to_a_wait_ms     = val;
     }
     fclose(f);
+}
+
+#include "wifi_probe.h"
+
+static void probe_wifi(void) {
+    if (!cfg_wifi_diagnostics && !cfg_ldn_install) { RADIO_LOG("boot_transport=usb reason=ldn_disabled\n"); return; }
+    char model[128] = {0};
+    FILE *model_file = fopen("/proc/device-tree/model", "rb");
+    if (model_file) { fread(model, 1, sizeof(model)-1, model_file); fclose(model_file); }
+    if (!ldn_supported_model(model)) { RADIO_LOG("boot_transport=usb reason=model_without_supported_wifi\n"); return; }
+#ifndef LDN_CRYPTO
+    if (!cfg_wifi_diagnostics) { RADIO_LOG("boot_transport=usb reason=ldn_not_built\n"); return; }
+#else
+    if (cfg_ldn_install && !cfg_wifi_diagnostics && !ldn_load_keys("/boot/prod.keys")) {
+        RADIO_LOG("boot_transport=usb reason=keys_missing_or_invalid\n"); return;
+    }
+#endif
+    struct utsname u;
+    const char *arch = uname(&u) == 0 && strncmp(u.machine, "armv7", 5) == 0 ? "armv7l" : "armv6l";
+    const char *mods[] = {"af_packet", "rfkill", "cfg80211", "brcmutil", "brcmfmac", "brcmfmac-cyw", "brcmfmac-bca", "brcmfmac-wcc"};
+    size_t used = 0;
+    for (size_t i = 0; i < sizeof(mods)/sizeof(mods[0]); i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "/modules/%s/%s.ko", arch, mods[i]);
+        if (access("/nexmon", F_OK) == 0 && strncmp(mods[i], "brcmfmac-", 9) == 0) continue;
+        bool ok = load_single_ko(path);
+        used += snprintf(wifi_module_status + used, sizeof(wifi_module_status) - used,
+                         "%s=%s\n", mods[i], ok ? "loaded" : "failed");
+    }
+    /* Firmware loading is asynchronous; allow a bounded diagnostic window. */
+    for (int i = 0; i < 100 && access("/sys/class/net/wlan0", F_OK) != 0; i++) sleep_ms(50);
+    probe_ldn_radio();
+    RADIO_LOG("boot_transport=%s reason=%s\n", ldn_target_selected ? "ldn" : "usb",
+              ldn_target_selected ? "target_selected" : "no_usable_ldn_target");
+}
+
+/* One bounded snapshot, then return the card to read-only operation. */
+static void save_boot_diagnostics(bool payload_ok, const char *udc_name) {
+    if (!cfg_sd_log) return;
+    if (mount(NULL, "/boot", NULL, MS_REMOUNT | MS_NOATIME, NULL) != 0) return;
+    FILE *f = fopen("/boot/civswitch.log", "w");
+    if (f) {
+        struct utsname u;
+        fprintf(f, "CivSwitch boot diagnostics (overwritten each diagnostic boot)\n");
+        if (uname(&u) == 0) fprintf(f, "kernel=%s arch=%s\n", u.release, u.machine);
+        fprintf(f, "usb_udc=%s payload=%s\n", udc_name, payload_ok ? "ready" : "failed");
+        fprintf(f, "LDN experimental build; see installer_transfer and console for result.\n");
+        fprintf(f, "wifi_diagnostics=%d\n%s", cfg_wifi_diagnostics, wifi_module_status);
+        fprintf(f, "nexmon=%d\n%s", access("/nexmon", F_OK) == 0, radio_log);
+        DIR *net = opendir("/sys/class/net");
+        if (net) {
+            struct dirent *entry;
+            while ((entry = readdir(net))) {
+                if (entry->d_name[0] != '.') fprintf(f, "network_interface=%s\n", entry->d_name);
+            }
+            closedir(net);
+        }
+        char *buf = malloc(65536);
+        if (buf) {
+            int n = klogctl(3, buf, 65536); /* Read without clearing kernel ring. */
+            if (n >= 0) fwrite(buf, 1, (size_t)n, f);
+            else fprintf(f, "kernel log unavailable: %s\n", strerror(errno));
+            free(buf);
+        }
+        fflush(f);
+        fsync(fileno(f));
+        fclose(f);
+    }
+    sync();
+    mount(NULL, "/boot", NULL, MS_REMOUNT | MS_RDONLY | MS_NOATIME, NULL);
 }
 
 static bool is_udc_configured(const char *udc_name) {
@@ -885,7 +973,17 @@ int main(int argc, char **argv) {
     if (!payload_ok) payload_ok = build_macro_from_payload("/payload.txt", &steps, &batches);
 
     if (boot_mounted) {
+        probe_wifi();
+        save_boot_diagnostics(payload_ok, udc_name);
         umount("/boot");
+    }
+
+    if (ldn_target_selected) {
+        /* A selected LDN session owns this boot, including failures: do not type
+         * a USB macro into a lobby or a partially running installer. */
+        free(steps.items);
+        led_set(false);
+        for (;;) { drain_hid_out_reports(fd_pad, fd_kbd); sleep_ms(20); }
     }
 
     if (!payload_ok) {

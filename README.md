@@ -1,53 +1,174 @@
-# CivSwitch - Pi Zero Image
+# CivSwitch for Raspberry Pi Zero
 
-Minimal, instant-boot Raspberry Pi Zero / Zero W / Zero 2 W image based on [`CivSwitch/PicoSwitch`](https://github.com/Gezine/CivSwitch/tree/main/PicoSwitch):
-- Uses [`CivSwitch`](https://github.com/Gezine/CivSwitch.git) as a git submodule (`CivSwitch/core.js`, `CivSwitch/PicoSwitch/compress.js`, `CivSwitch/installer-creator/`, `CivSwitch/send_js.py`).
-- Uses PicoSwitch’s composite USB HID identity (`0x0F0D:0x0092`, `"PICO SWITCH PRO."` / `"J24 CONTROLLER"`, Interface 0 = Switch USB Gamepad, Interface 1 = Boot Keyboard).
-- Runs a single **small static C binary** (`/init`) directly as PID 1 inside a **305 KB `initramf.gz`** — no systemd, no distro userland, no background services, no writable root filesystem.
-- Boots in ~2 seconds straight into RAM and unmounts the SD card before typing, so power can be unplugged at any moment without filesystem writes during playback.
-- Universal image (`build/civ7-pizero.img`, 40 MB): boots on both **Raspberry Pi Zero / Zero W** (`kernel.img`, ARMv6) and **Raspberry Pi Zero 2 W** (`kernel7.img`, ARMv7 SMP).
-- **Live-editable payload & timings**: `payload.txt` and `civswitch.conf` sit directly on the FAT16/FAT32 boot partition (`CIVSWITCH`). You can edit `payload.txt` or tweak timings in `civswitch.conf` from any PC/Mac without rebuilding or reflashing the image.
+Install CivSwitch over local wireless (LDN) or USB using a Raspberry Pi Zero.
+The image boots from an SD card and runs in RAM. No Raspberry Pi OS setup is needed.
 
-## Hardware Connection
+| Board | Installation method |
+| --- | --- |
+| Pi Zero | USB |
+| Pi Zero W | LDN first, USB if no lobby is found |
+| Pi Zero 2 W | LDN first, USB if no lobby is found |
 
-Use the micro-USB port labeled **`USB`** (the data/OTG port, **not** `PWR IN`) to connect the Raspberry Pi Zero to the Nintendo Switch or Switch Dock.
-- Connecting the `USB` port directly to the Switch / Dock provides both 5V power and USB data.
-- Alternatively, you can power the Pi Zero via `PWR IN` and connect `USB` to the Switch; `/init` waits for USB enumeration (`configured` state) before starting the macro countdown.
+LDN installation has been tested on Zero W and Zero 2 W. USB installation has
+been tested on the original Zero (non-W).
 
-### LED Status (`ACT` LED)
-- **3 rapid flashes at ~2s**: `/init` started in RAM.
-- **Steady 2 Hz blink (250 ms ON / 250 ms OFF)**: Waiting for USB connection/enumeration with the Switch.
-- **Solid ON**: Macro is actively running (~15–20 minutes for the default 87-line loader bootstrap).
-- **OFF**: Macro playback finished.
-- **Rapid 5 Hz blink**: HID delivery failed; playback stopped. Reconnect to retry.
+## Setup
 
-Playback waits for each USB report transfer before timing its hold. A busy endpoint is retried for up to five seconds; failed transitions stop the macro instead of silently skipping inputs. USB completion does not guarantee the game UI processed the input. `KEY_GAP_MS` applies only to consecutive characters sharing a physical keycode.
+Flash `build/civ7-pizero.img` with Raspberry Pi Imager or BalenaEtcher.
+The 40 MiB image supports all three boards.
 
-The gamepad endpoint supports 64-byte packets; ordinary input reports remain eight bytes. Host reports are consumed without echoing. Each step sends its selected interface once; WAIT releases both. A neutral wait before the first Enter lets the final character settle.
+### Wireless
 
-Transport regression checks: `python3 -m unittest discover -s tests`.
+1. Copy your `prod.keys` to the root of the `CIVSWITCH` SD partition.
+2. Open a Civ VII local wireless host lobby on the Switch.
+3. Power the Pi and leave the lobby open until installation finishes. Allow up to four minutes.
 
-## Flashing the Image
+No internet connection or home Wi-Fi credentials are needed. You can power the
+Pi through `PWR IN`. Connect the **USB** data port to the Switch or dock if you
+also want USB fallback.
 
-Flash `build/civ7-pizero.img` to a microSD card using **Raspberry Pi Imager**, **BalenaEtcher**, or `dd`:
+The Pi scans channels 1, 6, and 11 once per boot. Keep only the intended lobby
+open nearby: it selects the first verified LDN network without checking the
+game ID. Missing keys or no usable lobby lead to USB. After selecting a lobby,
+it stays in wireless mode until reboot, even if installation fails.
 
-```sh
-# Linux / macOS example (replace /dev/sdX or /dev/rdiskX with your SD card device):
-sudo dd if=build/civ7-pizero.img of=/dev/rdiskX bs=1m status=progress
+**UDP PAYLOAD CHANNEL** on the console is normal. The installer sends its files
+over that channel and requests any missing chunks. Check the console for the
+installation result.
+
+### USB
+
+Follow the [CivSwitch/PicoSwitch setup instructions](https://github.com/Gezine/CivSwitch/tree/main/PicoSwitch)
+to prepare the game, then connect the Pi's **USB** micro-USB port to the Switch
+or dock. `PWR IN` supplies power only.
+
+The non-W Zero starts in USB mode. On wireless models, either wait for discovery
+to finish or set these options in `civswitch.conf` to skip it:
+
+```ini
+LDN_INSTALL=0
+WIFI_DIAGNOSTICS=0
 ```
 
-Alternatively, format any microSD card as **FAT32** (MBR) and copy the contents of `build/boot/` directly to the root of the card.
+Typing starts two seconds after USB enumeration. The default 87-line bootstrap
+takes about 15–20 minutes. Once finished, disconnecting USB for more than one
+second re-arms playback.
 
-## Building from Source
+ACT LED during USB operation:
+
+- Blinking: waiting for the Switch.
+- Solid: typing.
+- Off: finished.
+- Rapid blinking: initialization or USB delivery failed.
+
+## SD-card settings
+
+Edit `civswitch.conf` on the `CIVSWITCH` partition:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `LDN_INSTALL` | `1` | Try wireless installation before USB. |
+| `WIFI_DIAGNOSTICS` | `0` | Run radio diagnostics even when LDN installation is disabled. |
+| `SD_LOG` | `0` | Save a boot/install log to `civswitch.log`. |
+| `LANG_JP` | `0` | Use Japanese input mode for USB typing. |
+
+USB timing settings are in the same file. You can also replace `payload.txt`
+without rebuilding; that file affects USB typing only.
+
+`prod.keys` must contain `master_key_00`, `aes_kek_generation_source`, and
+`aes_key_generation_source` as 16-byte hexadecimal values. Keys stay on the
+card and are never included in the image or printed in logs.
+
+## Troubleshooting
+
+Set `SD_LOG=1`, retry, then power off and read `civswitch.log` from the card.
+Allow four minutes for a wireless attempt to finish before removing power.
+The log is overwritten on each boot.
+
+- `boot_transport` shows which method was selected.
+- `ldn_keys` reports whether the required keys loaded.
+- `ldn_authenticated=1` means the LDN handshake succeeded.
+- `assigned_ip=found` means the console assigned the Pi an address.
+- `installer_transfer=acknowledged` means the files arrived. Confirm installation on the console.
+
+Authentication retries up to three times. If the console keeps requesting
+repairs and installation stalls, check the transfer receive/drop counters in
+the log. Restart the game before retrying a partially started installer.
+
+Logging briefly writes to the SD card after the wireless attempt and before USB
+playback. Early initialization failures and later USB playback errors are not
+captured in this log.
+
+## Updating an existing card
+
+When the kernels and firmware match, copy `build/boot/initramf.gz` over the
+card's `initramf.gz`. Update `payload.txt` too if the USB payload changed.
+Keep your keys and settings, then eject the card.
+
+For kernel or firmware changes, update the other files in `build/boot/` as well,
+or reflash the image. Back up keys and settings before reflashing.
+
+## Building
+
+Install Python 3, Node.js/npm, and Docker with ARMv6/ARMv7 container support.
+Prepare the Nexmon modules below, then run:
 
 ```sh
 git submodule update --init --recursive
-python3 tools/build_image.py
+python3 tools/build_image.py --nexmon --ldn-crypto
 ```
 
+The build writes `build/civ7-pizero.img` and the boot files in `build/boot/`.
+It downloads dependencies, so internet access is required while building.
+
 Options:
-- `python3 tools/build_image.py --payload path/to/custom.js` — stages a custom JS payload using `CivSwitch/PicoSwitch/tools/make_payload.py` + `CivSwitch/PicoSwitch/compress.js` -> `build/payload.txt`, and packs `build/civ7-pizero.img`.
 
-Building and flashing a new image restores the timings in `boot/civswitch.conf`. Reapply any SD-card timing customizations after flashing.
+- `--diagnostics`: enable SD logging and Wi-Fi diagnostics in the image.
+- `--payload path/to/custom.js`: use a custom USB payload. LDN uses the pinned CivSwitch installer.
+- Omit `--nexmon --ldn-crypto` for a USB-only image.
 
-Playback starts two seconds after enumeration and runs once per connection. After completion, the device stays idle; disconnecting USB for more than one second re-arms it. `LANG_JP=0` is the English-console default; set `LANG_JP=1` to switch the Japanese IME using Alt+Space, followed by a 200 ms wait before each line.
+LDN payload generation lives in `tools/ldn/build_payloads.py`.
+
+### Nexmon modules
+
+The builder expects precompiled drivers for the packaged `6.12.13-0-rpi` kernels.
+Use the `brcmfmac-nexmon-dkms` 6.12.2 and `firmware-nexmon` 0.2 archives from
+Kali's package pool:
+
+```text
+build/cache/brcmfmac-nexmon-6.12.2.tar.xz
+build/cache/firmware-nexmon-0.2.tar.xz
+```
+
+Compile the driver in separate Alpine 3.21 `linux/arm/v6` and `linux/arm/v7`
+containers against `linux-rpi-dev=6.12.13-r0`. Place the results at:
+
+```text
+build/brcmfmac-nexmon-dkms-6.12.2/brcmfmac.ko
+build/nexmon-armv7/brcmfmac-nexmon-dkms-6.12.2/brcmfmac.ko
+```
+
+The image includes the driver and firmware license notices on the boot partition.
+
+### Tests
+
+```sh
+python3 -m unittest discover -s tests -p 'test_transport.py'
+python3 -m unittest discover -s tests -p 'test_ldn_advertisement.py'
+python3 tests/test_ldn_scan.py
+```
+
+The scan test uses the native C compiler on Linux and Docker on other platforms. On Linux, compile `tests/ldn_crypto_test.c` with
+`-I src -lcrypto`. After generating LDN assets, compile
+`tests/ldn_transfer_test.c` with `-DLDN_CRYPTO -Ibuild/ldn -lcrypto`.
+Both require OpenSSL development headers.
+
+## Credits
+
+- Gezine: [CivSwitch and PicoSwitch](https://github.com/Gezine/CivSwitch).
+- sean: `esp32-ldn-civ7`, the basis for the wireless installer port.
+- CivSwitchLDN, Kinnay LDN, and pokeldn: LDN protocol work.
+- Nexmon and brcmfmac: Wi-Fi driver and firmware support.
+
+Upstream licenses apply to their respective components. The CivSwitch submodule
+is pinned to `59e27b4894e91bc53ece58dd5e9add7335639ef3`.

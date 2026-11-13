@@ -28,6 +28,10 @@ from pathlib import Path
 ALPINE_MIRROR = "https://dl-cdn.alpinelinux.org/alpine/v3.21/main"
 
 PACKAGES = {
+    "wireless_regdb": {
+        "url": f"{ALPINE_MIRROR}/armhf/wireless-regdb-2024.07.04-r0.apk",
+        "sha256": "f61a21ef99a0f06423fa3842cd1fc472118824ec9d81d6763129ac433f6d8ee6",
+    },
     "bootloader_common": {
         "url": f"{ALPINE_MIRROR}/armhf/raspberrypi-bootloader-common-1.20250210-r0.apk",
         "sha256": "68a43281777c54cc7353521180cd0e17843cafef9b5f3233e055e97f9eab1ba8",
@@ -72,6 +76,39 @@ USB_MODULES = [
     ("libcomposite.ko", f"lib/modules/{KERNEL_VER}/kernel/drivers/usb/gadget/libcomposite.ko.xz"),
     ("usb_f_hid.ko",    f"lib/modules/{KERNEL_VER}/kernel/drivers/usb/gadget/function/usb_f_hid.ko.xz"),
 ]
+
+
+WIFI_MODULES = [(Path(p).name.removesuffix(".xz"), f"lib/modules/{KERNEL_VER}/kernel/{p}") for p in [
+    "net/packet/af_packet.ko.xz",
+    "net/rfkill/rfkill.ko.xz", "net/wireless/cfg80211.ko.xz",
+    "drivers/net/wireless/broadcom/brcm80211/brcmutil/brcmutil.ko.xz",
+    "drivers/net/wireless/broadcom/brcm80211/brcmfmac/brcmfmac.ko.xz",
+    "drivers/net/wireless/broadcom/brcm80211/brcmfmac/cyw/brcmfmac-cyw.ko.xz",
+    "drivers/net/wireless/broadcom/brcm80211/brcmfmac/bca/brcmfmac-bca.ko.xz",
+    "drivers/net/wireless/broadcom/brcm80211/brcmfmac/wcc/brcmfmac-wcc.ko.xz",
+]]
+
+
+def add_wifi_firmware(cpio, cache_dir, nexmon=False):
+    archive = cache_dir / "wifi-firmware.tar.gz"
+    if not archive.exists():
+        urllib.request.urlretrieve("https://api.github.com/repos/RPi-Distro/firmware-nonfree/tarball/5d2295b633d94641253e16ba90fc847436fc9d4a", archive)
+    for directory in ["lib", "lib/firmware", "lib/firmware/brcm"]:
+        cpio.add_dir(directory)
+    regdb = download_pkg("wireless_regdb", PACKAGES["wireless_regdb"], cache_dir)
+    paths = {f"lib/firmware/{name}": cache_dir / name for name in ["regulatory.db", "regulatory.db.p7s"]}
+    extract_from_apk(regdb, paths)
+    for name, path in paths.items():
+        cpio.add_file(name, path.read_bytes())
+    if nexmon:
+        archive = cache_dir / "firmware-nexmon-0.2.tar.xz"
+        if sha256_file(archive) != "48530a2865d115037021a30b7529dad93d49ae371068c5d3a0f92d76cc905680":
+            raise RuntimeError("Nexmon firmware archive checksum mismatch")
+    with tarfile.open(archive) as tf:
+        for member in tf.getmembers():
+            name = Path(member.name).name
+            if ("/brcm/" in member.name) and "model-zero" in name and ("model-zero-w." in name or "model-zero-2-w." in name):
+                cpio.add_file("lib/firmware/brcm/" + name, tf.extractfile(member).read())
 
 
 def sha256_file(path: Path) -> str:
@@ -163,8 +200,17 @@ def patch_dtbs_for_dwc2_and_led(boot_dir: Path):
         )
 
 
-def build_init_binary(src_c: Path, out_bin: Path):
+def build_init_binary(src_c: Path, out_bin: Path, ldn_crypto=False):
     out_bin.parent.mkdir(parents=True, exist_ok=True)
+
+    if ldn_crypto:
+        subprocess.run(["docker", "run", "--rm", "--platform", "linux/arm/v6",
+            "-v", f"{src_c.parent.resolve()}:/src:ro", "-v", f"{out_bin.parent.resolve()}:/out",
+            "alpine:3.21", "sh", "-c",
+            "apk add --no-cache build-base linux-headers openssl-dev openssl-libs-static >/dev/null && "
+            "gcc -DLDN_CRYPTO -I/out/ldn -O2 -Wall -Wextra -static -s /src/init.c -o /out/init -lcrypto -pthread"], check=True)
+        out_bin.chmod(0o755)
+        return
 
     toolchains = [
         ("arm-linux-musleabihf-gcc", ["-march=armv6zk+fp", "-mtune=arm1176jzf-s", "-mfloat-abi=hard"]),
@@ -265,18 +311,31 @@ class CpioNewcBuilder:
         return out.getvalue()
 
 
-def build_initramfs(init_bin: Path, payload_txt: Path, modules_dir: Path, out_cpio_gz: Path):
+def build_initramfs(init_bin: Path, payload_txt: Path, modules_dir: Path, out_cpio_gz: Path, nexmon=False, ldn_crypto=False):
     cpio = CpioNewcBuilder()
     for d in ["dev", "proc", "sys", "boot", "modules", "modules/armv6l", "modules/armv7l"]:
         cpio.add_dir(d, 0o755)
 
     cpio.add_file("init", init_bin.read_bytes(), 0o755)
     cpio.add_file("payload.txt", payload_txt.read_bytes(), 0o644)
+    if ldn_crypto:
+        cpio.add_dir("ldn")
+        for name in ("template.b64", "apply.b64"):
+            cpio.add_file("ldn/" + name, (init_bin.parent / "ldn" / name).read_bytes())
 
     for arch in ["armv6l", "armv7l"]:
-        for mod_name, _ in USB_MODULES:
+        for mod_name, _ in USB_MODULES + WIFI_MODULES:
+            if nexmon and mod_name.startswith("brcmfmac-"):
+                continue
             ko_path = modules_dir / arch / mod_name
+            if nexmon and mod_name == "brcmfmac.ko":
+                base = modules_dir.parent if arch == "armv6l" else modules_dir.parent / "nexmon-armv7"
+                ko_path = base / "brcmfmac-nexmon-dkms-6.12.2" / "brcmfmac.ko"
             cpio.add_file(f"modules/{arch}/{mod_name}", ko_path.read_bytes(), 0o644)
+
+    add_wifi_firmware(cpio, modules_dir.parent / "cache", nexmon)
+    if nexmon:
+        cpio.add_file("nexmon", b"driver=6.12.2 firmware=0.2\n")
 
     out_cpio_gz.parent.mkdir(parents=True, exist_ok=True)
     data = cpio.finish_gzip()
@@ -572,6 +631,9 @@ def create_fat16_boot_image(boot_dir: Path, out_img: Path, size_mb: int = 40):
 def main():
     parser = argparse.ArgumentParser(description="Build CivSwitch Raspberry Pi Zero minimal OS image")
     parser.add_argument("--payload", type=str, default=None, help="Optional custom JS payload to stage into ../core.js")
+    parser.add_argument("--diagnostics", action="store_true", help="Enable SD logging and Wi-Fi bring-up probe")
+    parser.add_argument("--nexmon", action="store_true", help="Use locally built Nexmon modules and cached firmware 0.2")
+    parser.add_argument("--ldn-crypto", action="store_true", help="Enable SD-card key loading and advertisement decryption (Docker)")
     args = parser.parse_args()
 
     root_dir = Path(__file__).resolve().parent.parent
@@ -610,8 +672,11 @@ def main():
     subprocess.run(["node", "compress.js"], cwd=str(stage_pico), check=True)
     shutil.copyfile(stage_pico / "payload.txt", payload_txt)
 
+    if args.ldn_crypto:
+        subprocess.run([sys.executable, str(root_dir / "tools/ldn/build_payloads.py")], check=True)
+
     # 2. Compile static ARMv6 /init binary from src/init.c
-    build_init_binary(root_dir / "src" / "init.c", init_bin)
+    build_init_binary(root_dir / "src" / "init.c", init_bin, args.ldn_crypto)
 
     # 3. Download and extract RPi bootloader, DTBs, kernels, and USB gadget modules
     apk_paths = {k: download_pkg(k, v, cache_dir) for k, v in PACKAGES.items()}
@@ -657,24 +722,34 @@ def main():
 
     extract_from_apk(
         apk_paths["linux_rpi_armhf"],
-        {src: modules_out / "armv6l" / dst for dst, src in USB_MODULES},
+        {src: modules_out / "armv6l" / dst for dst, src in USB_MODULES + WIFI_MODULES},
         decompress_xz=True,
     )
     extract_from_apk(
         apk_paths["linux_rpi_armv7"],
-        {src: modules_out / "armv7l" / dst for dst, src in USB_MODULES},
+        {src: modules_out / "armv7l" / dst for dst, src in USB_MODULES + WIFI_MODULES},
         decompress_xz=True,
     )
 
     # 4. Pack initramf.gz (pure 8.3 name so RPi bootloader needs no LFN)
     initramfs_path = boot_out / "initramf.gz"
-    build_initramfs(init_bin, payload_txt, modules_out, initramfs_path)
+    build_initramfs(init_bin, payload_txt, modules_out, initramfs_path, args.nexmon, args.ldn_crypto)
     shutil.copyfile(initramfs_path, root_dir / "build" / "initramfs.cpio.gz")
 
     # 5. Copy config.txt, cmdline.txt, civswitch.conf, and payload.txt to boot partition
     for cfg in ["config.txt", "cmdline.txt", "civswitch.conf"]:
         shutil.copyfile(root_dir / "boot" / cfg, boot_out / cfg)
     shutil.copyfile(payload_txt, boot_out / "payload.txt")
+
+    if args.diagnostics:
+        conf = boot_out / "civswitch.conf"
+        conf.write_text(conf.read_text().replace("SD_LOG=0", "SD_LOG=1").replace("WIFI_DIAGNOSTICS=0", "WIFI_DIAGNOSTICS=1"))
+
+    if args.nexmon:
+        for archive, target in [("firmware-nexmon-0.2.tar.xz", "nexmon-firmware-license.txt"), ("brcmfmac-nexmon-6.12.2.tar.xz", "nexmon-driver-license.txt")]:
+            with tarfile.open(cache_dir / archive) as tf:
+                member = next(m for m in tf if m.name.endswith("/debian/copyright"))
+                (boot_out / target).write_bytes(tf.extractfile(member).read())
 
     # 6. Create bootable SD card image build/civ7-pizero.img
     img_path = root_dir / "build" / "civ7-pizero.img"

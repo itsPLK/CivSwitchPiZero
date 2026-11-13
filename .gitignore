@@ -2,3 +2,9 @@ build/
 .DS_Store
 __pycache__/
 *.pyc
+
+# Local console keys and generated secret material
+prod.keys
+*.keys
+keys.h
+ldn.keys
