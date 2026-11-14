@@ -16,6 +16,7 @@ import hashlib
 import io
 import lzma
 import math
+import os
 import shutil
 import struct
 import subprocess
@@ -208,7 +209,8 @@ def build_init_binary(src_c: Path, out_bin: Path, ldn_crypto=False):
             "-v", f"{src_c.parent.resolve()}:/src:ro", "-v", f"{out_bin.parent.resolve()}:/out",
             "alpine:3.21", "sh", "-c",
             "apk add --no-cache build-base linux-headers openssl-dev openssl-libs-static >/dev/null && "
-            "gcc -DLDN_CRYPTO -I/out/ldn -O2 -Wall -Wextra -static -s /src/init.c -o /out/init -lcrypto -pthread"], check=True)
+            "gcc -DLDN_CRYPTO -I/out/ldn -O2 -Wall -Wextra -static -s /src/init.c -o /out/init -lcrypto -pthread && "
+            f"chown {os.getuid()}:{os.getgid()} /out/init"], check=True)
         out_bin.chmod(0o755)
         return
 
@@ -248,7 +250,8 @@ def build_init_binary(src_c: Path, out_bin: Path, ldn_crypto=False):
                 "-v", f"{out_bin.parent.resolve()}:/out",
                 "alpine:3.21", "sh", "-c",
                 "apk add --no-cache build-base linux-headers >/dev/null && "
-                f"gcc -O2 -Wall -Wextra -static -s /src/{src_c.name} -o /out/{out_bin.name}",
+                f"gcc -O2 -Wall -Wextra -static -s /src/{src_c.name} -o /out/{out_bin.name} && "
+                f"chown {os.getuid()}:{os.getgid()} /out/{out_bin.name}",
             ],
             check=True,
         )

@@ -111,10 +111,11 @@ or reflash the image. Back up keys and settings before reflashing.
 ## Building
 
 Install Python 3, Node.js/npm, and Docker with ARMv6/ARMv7 container support.
-Prepare the Nexmon modules below, then run:
+Build the Nexmon modules and image with:
 
 ```sh
 git submodule update --init --recursive
+python3 tools/build_nexmon.py
 python3 tools/build_image.py --nexmon --ldn-crypto
 ```
 
@@ -131,7 +132,11 @@ LDN payload generation lives in `tools/ldn/build_payloads.py`.
 
 ### Nexmon modules
 
-The builder expects precompiled drivers for the packaged `6.12.13-0-rpi` kernels.
+`tools/build_nexmon.py` downloads checksum-pinned sources and compiles drivers
+for both boards using Docker ARM containers. GitHub Actions runs this step and
+builds with `--nexmon --ldn-crypto`; its image supports LDN and USB fallback.
+
+For manual driver preparation, the builder expects precompiled drivers for the packaged `6.12.13-0-rpi` kernels.
 Use the `brcmfmac-nexmon-dkms` 6.12.2 and `firmware-nexmon` 0.2 archives from
 Kali's package pool:
 
